@@ -6,6 +6,7 @@ import sympy as sp
 from ..tensor import Tensor
 from ..ops import PlaceHolder
 from ..chakra.node import Node
+from .inference_filter import filter_inference_tensors as _filter_inference_tensors
 import tqdm
 
 
@@ -91,8 +92,10 @@ class TensorGraph:
         return symbols
 
     @classmethod
-    def load_tensor_graph(cls, csv_filename, json_filename=None):
+    def load_tensor_graph(cls, csv_filename, json_filename=None, inference=False):
         tensors = Tensor.parse_records(csv_filename)
+        if inference:
+            tensors = _filter_inference_tensors(tensors)
         graph = cls(tensors)
         if json_filename is None:
             assert csv_filename.endswith("csv")
@@ -106,17 +109,26 @@ class TensorGraph:
         for tensor_id in meta_data["in_tensors"]:
             if not "@" in tensor_id:
                 tensor_id += "@0"
+            if inference and tensor_id not in tensor_id_map_tensor:
+                continue  # backward in/out entries dropped with their tensors
             assert tensor_id in tensor_id_map_tensor
             graph.in_tensors.append(tensor_id_map_tensor[tensor_id])
         for tensor_id in meta_data["out_tensors"]:
             if not "@" in tensor_id:
                 tensor_id += "@0"
+            if inference and tensor_id not in tensor_id_map_tensor:
+                continue
             assert tensor_id in tensor_id_map_tensor
             graph.out_tensors.append(tensor_id_map_tensor[tensor_id])
         symbols = set()
         for symbol in meta_data["symbols"]:
             symbols.add(sp.parse_expr(symbol))
-        assert symbols == graph.get_symbols()
+        if inference:
+            # Forward-only graphs are a subset of the declared symbol space;
+            # dropping backward tensors may legitimately drop some symbols.
+            assert graph.get_symbols() <= symbols
+        else:
+            assert symbols == graph.get_symbols()
         graph.sanity_check()
         return graph
 

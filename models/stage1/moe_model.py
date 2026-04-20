@@ -10,36 +10,48 @@ from .llama_model import group_query_attention, transformer_decoders
 from .utils import reduce_chain
 
 
-def expert_branch(ffn_path=None, moe_wrapper_path=None):
+# Phase 17 (KernelCache): same link-filter helper as gpt_model.py / llama_model.py.
+def _keep_existing_links(graphs, links):
+    ids = set()
+    for g in graphs:
+        for t in g.tensors:
+            ids.add(t.id)
+    def _norm(name):
+        return name if "@" in name else f"{name}@0"
+    return {k: v for k, v in links.items() if _norm(k) in ids and _norm(v) in ids}
+
+
+def expert_branch(ffn_path=None, moe_wrapper_path=None, inference=False):
     if ffn_path is None:
         ffn_path = "./sharding_spreadsheets/module3/tpsp_moe/llama_feed_forward_network.csv"
     if moe_wrapper_path is None:
         moe_wrapper_path = "./sharding_spreadsheets/module3/tpsp_moe/expert_wrapper.csv"
 
     ffn = ReplicateGraph.apply(
-        TensorGraph.load_tensor_graph(ffn_path),
+        TensorGraph.load_tensor_graph(ffn_path, inference=inference),
         "ffn.%s",
         old_symbol_map_new_symbol={"Seq": "Seq*KExperts/(Experts*ep)"},
     )
     moe_wrapper = ReplicateGraph.apply(
-        TensorGraph.load_tensor_graph(moe_wrapper_path),
+        TensorGraph.load_tensor_graph(moe_wrapper_path, inference=inference),
         "ldis.%s",
     )
 
-    expert = ConnectGraph.apply(
-        [moe_wrapper, ffn],
-        {
-            "ldis.x_expert": "ffn.x0",
-            "ffn.xdown": "ldis.y_expert",
-            "ldis.dy_expert": "ffn.dxdown",
-            "ffn.dx0": "ldis.dx_expert",
-        },
-    )
+    links = {
+        "ldis.x_expert": "ffn.x0",
+        "ffn.xdown": "ldis.y_expert",
+        "ldis.dy_expert": "ffn.dxdown",
+        "ffn.dx0": "ldis.dx_expert",
+    }
+    graphs = [moe_wrapper, ffn]
+    if inference:
+        links = _keep_existing_links(graphs, links)
+    expert = ConnectGraph.apply(graphs, links)
     return expert
 
 
 def feed_forward_network(
-    symbol_map_value, ffn_path=None, expert_wrapper_path=None, moe_frame_path=None
+    symbol_map_value, ffn_path=None, expert_wrapper_path=None, moe_frame_path=None, inference=False
 ):
     if moe_frame_path is None:
         moe_frame_path = "./sharding_spreadsheets/module3/tpsp_moe/moe_frame.csv"
@@ -51,9 +63,9 @@ def feed_forward_network(
     assert experts_each_group == int(experts_each_group)
     experts_each_group = int(experts_each_group)
 
-    expert = expert_branch(ffn_path, expert_wrapper_path)
+    expert = expert_branch(ffn_path, expert_wrapper_path, inference=inference)
     moe_frame = ReplicateGraph.apply(
-        TensorGraph.load_tensor_graph(moe_frame_path), "moe.%s"
+        TensorGraph.load_tensor_graph(moe_frame_path, inference=inference), "moe.%s"
     )
 
     links = dict()
@@ -69,47 +81,54 @@ def feed_forward_network(
     moe = ConnectGraph.apply([moe_frame] + branches, links)
     tensor_id_map_tensor = moe.get_tensor_id_map_tensor()
 
-    # one to multiple
+    # one to multiple — xrouted is forward, dyrouted is backward
     moe_xrouted = tensor_id_map_tensor["moe.xrouted@0"]
-    moe_dyrouted = tensor_id_map_tensor["moe.dyrouted@0"]
+    moe_dyrouted = tensor_id_map_tensor["moe.dyrouted@0"] if not inference else None
     for i in range(experts_each_group):
         links = dict()
         links["moe.xrouted"] = f"moe.{i}.ldis.x"
-        links["moe.dyrouted"] = f"moe.{i}.ldis.dy"
+        if not inference:
+            links["moe.dyrouted"] = f"moe.{i}.ldis.dy"
         moe = ConnectGraph.apply([moe], links, inplace=True)
         moe.out_tensors.append(moe_xrouted)
-        moe.out_tensors.append(moe_dyrouted)
+        if not inference:
+            moe.out_tensors.append(moe_dyrouted)
 
     moe.out_tensors.remove(moe_xrouted)
-    moe.out_tensors.remove(moe_dyrouted)
+    if not inference:
+        moe.out_tensors.remove(moe_dyrouted)
 
-    # multiple to one
+    # multiple to one — yrouted is forward, dxrouted is backward
     to_be_reduce_moe_dxrouted = list()
     to_be_reduce_moe_yrouted = list()
 
     for i in range(experts_each_group):
-        branch_ldis_dx = tensor_id_map_tensor[f"moe.{i}.ldis.dx@0"]
-        to_be_reduce_moe_dxrouted.append(branch_ldis_dx)
-        moe.out_tensors.remove(branch_ldis_dx)
+        if not inference:
+            branch_ldis_dx = tensor_id_map_tensor[f"moe.{i}.ldis.dx@0"]
+            to_be_reduce_moe_dxrouted.append(branch_ldis_dx)
+            moe.out_tensors.remove(branch_ldis_dx)
 
         branch_ldis_y = tensor_id_map_tensor[f"moe.{i}.ldis.y@0"]
         to_be_reduce_moe_yrouted.append(branch_ldis_y)
         moe.out_tensors.remove(branch_ldis_y)
 
     # merge those reduce in a chain with 0 ops, which equavilent to a single node
-    merged_dxrouted = reduce_chain(to_be_reduce_moe_dxrouted, "moe.dxrouted_r%d", amp=0)
-    moe.tensors.extend(merged_dxrouted)
-    if len(merged_dxrouted) > 0:
-        merged_dxrouted[-1].op_attr = (
-            "1"  # last node counts a whole elementwise op, which equalient to a single node
-        )
-        merged_dxrouted_last = merged_dxrouted[-1]
-    else:
-        assert len(to_be_reduce_moe_dxrouted) == 1
-        merged_dxrouted_last = to_be_reduce_moe_dxrouted[0]
-    moe.out_tensors.append(
-        merged_dxrouted_last
-    )  # add last node as output for future linkage
+    final_links = dict()
+    if not inference:
+        merged_dxrouted = reduce_chain(to_be_reduce_moe_dxrouted, "moe.dxrouted_r%d", amp=0)
+        moe.tensors.extend(merged_dxrouted)
+        if len(merged_dxrouted) > 0:
+            merged_dxrouted[-1].op_attr = (
+                "1"  # last node counts a whole elementwise op, which equalient to a single node
+            )
+            merged_dxrouted_last = merged_dxrouted[-1]
+        else:
+            assert len(to_be_reduce_moe_dxrouted) == 1
+            merged_dxrouted_last = to_be_reduce_moe_dxrouted[0]
+        moe.out_tensors.append(
+            merged_dxrouted_last
+        )  # add last node as output for future linkage
+        final_links[merged_dxrouted_last.name] = "moe.dxrouted"
 
     merged_yrouted = reduce_chain(to_be_reduce_moe_yrouted, "moe.yrouted_r%d", amp=0)
     moe.tensors.extend(merged_yrouted)
@@ -120,17 +139,16 @@ def feed_forward_network(
         assert len(to_be_reduce_moe_yrouted) == 1
         merged_yrouted_last = to_be_reduce_moe_yrouted[0]
     moe.out_tensors.append(merged_yrouted_last)
+    final_links[merged_yrouted_last.name] = "moe.yrouted"
 
-    links = {
-        merged_dxrouted_last.name: "moe.dxrouted",
-        merged_yrouted_last.name: "moe.yrouted",
-    }
-    moe = ConnectGraph.apply([moe], links)
+    if inference:
+        final_links = _keep_existing_links([moe], final_links)
+    moe = ConnectGraph.apply([moe], final_links)
     return moe
 
 
 def transformer_decoder_block(
-    symbol_map_value, layernorm_path=None, residual_path=None
+    symbol_map_value, layernorm_path=None, residual_path=None, inference=False
 ):
     if layernorm_path is None:
         layernorm_path = "./sharding_spreadsheets/module3/tpsp_moe/layer_norm.csv"
@@ -138,29 +156,29 @@ def transformer_decoder_block(
         residual_path = "./sharding_spreadsheets/module3/tpsp_moe/residual.csv"
 
     input_layernorm = ReplicateGraph.apply(
-        TensorGraph.load_tensor_graph(layernorm_path),
+        TensorGraph.load_tensor_graph(layernorm_path, inference=inference),
         "input_norm.%s",
         old_symbol_map_new_symbol={"tp": "tp"},
     )
     mha = ReplicateGraph.apply(
-        group_query_attention(), "mha.%s", old_symbol_map_new_symbol={"tp": "tp"}
+        group_query_attention(inference=inference), "mha.%s", old_symbol_map_new_symbol={"tp": "tp"}
     )
     mha_res = ReplicateGraph.apply(
-        TensorGraph.load_tensor_graph(residual_path),
+        TensorGraph.load_tensor_graph(residual_path, inference=inference),
         "mha_res.%s",
         old_symbol_map_new_symbol={"tp": "tp"},
     )
 
     post_layernorm = ReplicateGraph.apply(
-        TensorGraph.load_tensor_graph(layernorm_path),
+        TensorGraph.load_tensor_graph(layernorm_path, inference=inference),
         "post_attn_norm.%s",
         old_symbol_map_new_symbol={"tp": "tp"},
     )
 
-    ffn = feed_forward_network(symbol_map_value)
+    ffn = feed_forward_network(symbol_map_value, inference=inference)
 
     ffn_res = ReplicateGraph.apply(
-        TensorGraph.load_tensor_graph(residual_path),
+        TensorGraph.load_tensor_graph(residual_path, inference=inference),
         "ffn_res.%s",
         old_symbol_map_new_symbol={"tp": "tp"},
     )
@@ -190,40 +208,43 @@ def transformer_decoder_block(
     links["ffn_res.dx1"] = "moe.dy"
     # links["ffn_res_dx2"] = "post_layer_norm_dy"
 
-    decoder_block = ConnectGraph.apply(
-        [input_layernorm, mha, mha_res, post_layernorm, ffn, ffn_res], links
-    )
+    graphs = [input_layernorm, mha, mha_res, post_layernorm, ffn, ffn_res]
+    if inference:
+        links = _keep_existing_links(graphs, links)
+    decoder_block = ConnectGraph.apply(graphs, links)
 
-    tensor_id_map_tensor = decoder_block.get_tensor_id_map_tensor()
+    # Phase 17: skip backward Add-op rewrites + FSDP weight manager in inference.
+    if not inference:
+        tensor_id_map_tensor = decoder_block.get_tensor_id_map_tensor()
 
-    input_norm_dy = tensor_id_map_tensor["input_norm.dy@0"]
-    assert input_norm_dy.op_type == PlaceHolder.type_name
-    input_norm_dy.op_type = Add.type_name
-    input_norm_dy.x1 = tensor_id_map_tensor["mha.dx@0"]
-    input_norm_dy.x2 = tensor_id_map_tensor["mha_res.dx2@0"]
-    input_norm_dy.x2_shape = copy.deepcopy(input_norm_dy.x1_shape)
-    input_norm_dy.x2_hidden = copy.deepcopy(input_norm_dy.x1_hidden)
-    decoder_block.in_tensors.remove(input_norm_dy)
-    decoder_block.out_tensors.remove(input_norm_dy.x1)
-    decoder_block.out_tensors.remove(input_norm_dy.x2)
+        input_norm_dy = tensor_id_map_tensor["input_norm.dy@0"]
+        assert input_norm_dy.op_type == PlaceHolder.type_name
+        input_norm_dy.op_type = Add.type_name
+        input_norm_dy.x1 = tensor_id_map_tensor["mha.dx@0"]
+        input_norm_dy.x2 = tensor_id_map_tensor["mha_res.dx2@0"]
+        input_norm_dy.x2_shape = copy.deepcopy(input_norm_dy.x1_shape)
+        input_norm_dy.x2_hidden = copy.deepcopy(input_norm_dy.x1_hidden)
+        decoder_block.in_tensors.remove(input_norm_dy)
+        decoder_block.out_tensors.remove(input_norm_dy.x1)
+        decoder_block.out_tensors.remove(input_norm_dy.x2)
 
-    post_attn_norm_dy = tensor_id_map_tensor["post_attn_norm.dy@0"]
-    assert post_attn_norm_dy.op_type == PlaceHolder.type_name
-    post_attn_norm_dy.op_type = Add.type_name
-    post_attn_norm_dy.x1 = tensor_id_map_tensor["moe.dx@0"]
-    post_attn_norm_dy.x2 = tensor_id_map_tensor["ffn_res.dx2@0"]
-    post_attn_norm_dy.x2_shape = copy.deepcopy(post_attn_norm_dy.x1_shape)
-    post_attn_norm_dy.x2_hidden = copy.deepcopy(post_attn_norm_dy.x1_hidden)
-    decoder_block.in_tensors.remove(post_attn_norm_dy)
-    decoder_block.out_tensors.remove(post_attn_norm_dy.x1)
-    decoder_block.out_tensors.remove(post_attn_norm_dy.x2)
+        post_attn_norm_dy = tensor_id_map_tensor["post_attn_norm.dy@0"]
+        assert post_attn_norm_dy.op_type == PlaceHolder.type_name
+        post_attn_norm_dy.op_type = Add.type_name
+        post_attn_norm_dy.x1 = tensor_id_map_tensor["moe.dx@0"]
+        post_attn_norm_dy.x2 = tensor_id_map_tensor["ffn_res.dx2@0"]
+        post_attn_norm_dy.x2_shape = copy.deepcopy(post_attn_norm_dy.x1_shape)
+        post_attn_norm_dy.x2_hidden = copy.deepcopy(post_attn_norm_dy.x1_hidden)
+        decoder_block.in_tensors.remove(post_attn_norm_dy)
+        decoder_block.out_tensors.remove(post_attn_norm_dy.x1)
+        decoder_block.out_tensors.remove(post_attn_norm_dy.x2)
 
-    decoder_block = FSDPWeightGradManager.apply(decoder_block)
+        decoder_block = FSDPWeightGradManager.apply(decoder_block)
 
     return decoder_block
 
 
-def transformer(num_layers, symbol_map_value, embedding_path=None, regenerate=False):
+def transformer(num_layers, symbol_map_value, embedding_path=None, regenerate=False, inference=False):
     from . import CACHE_DIR
     import os
 
@@ -232,8 +253,10 @@ def transformer(num_layers, symbol_map_value, embedding_path=None, regenerate=Fa
     kexperts = symbol_map_value[kexperts]
     ep = symbol_map_value[ep]
     experts_each_group = experts / ep
+    # Phase 17: include mode in cache filename.
+    mode_tag = "inference" if inference else "training"
     cache_filename = os.path.join(
-        CACHE_DIR, f"moe_{num_layers}_{experts_each_group}.csv"
+        CACHE_DIR, f"moe_{num_layers}_{experts_each_group}_{mode_tag}.csv"
     )
     if os.path.exists(cache_filename) and not regenerate:
         return TensorGraph.load_tensor_graph(cache_filename)
@@ -241,18 +264,18 @@ def transformer(num_layers, symbol_map_value, embedding_path=None, regenerate=Fa
     if embedding_path is None:
         embedding_path = "./sharding_spreadsheets/module3/tpsp_moe/embedding.csv"
     in_emb = ReplicateGraph.apply(
-        TensorGraph.load_tensor_graph(embedding_path),
+        TensorGraph.load_tensor_graph(embedding_path, inference=inference),
         "in_emb.%s",
         old_symbol_map_new_symbol={"Din": "Dvocal", "Dout": "Dmodel", "tp": "tp"},
     )
     out_emb = ReplicateGraph.apply(
-        TensorGraph.load_tensor_graph(embedding_path),
+        TensorGraph.load_tensor_graph(embedding_path, inference=inference),
         "out_emb.%s",
         old_symbol_map_new_symbol={"Din": "Dmodel", "Dout": "Dvocal", "tp": "tp"},
     )
 
-    decoder_template = transformer_decoder_block(symbol_map_value)
-    decoders = transformer_decoders(num_layers, decoder_template)
+    decoder_template = transformer_decoder_block(symbol_map_value, inference=inference)
+    decoders = transformer_decoders(num_layers, decoder_template, inference=inference)
 
     links = dict()
     links["in_emb.y"] = "transformer.0.input_norm.x"
@@ -260,17 +283,22 @@ def transformer(num_layers, symbol_map_value, embedding_path=None, regenerate=Fa
     links[f"transformer.{num_layers-1}.ffn_res.y"] = "out_emb.x"
     links["out_emb.dx"] = f"transformer.{num_layers-1}.ffn_res.dy"
 
-    transformer = ConnectGraph.apply([decoders, in_emb, out_emb], links)
+    graphs = [decoders, in_emb, out_emb]
+    if inference:
+        links = _keep_existing_links(graphs, links)
+    transformer = ConnectGraph.apply(graphs, links)
 
-    loss = ReplicateGraph.apply(
-        TensorGraph.load_tensor_graph("./sharding_spreadsheets/module3/tpsp_moe/loss.csv"),
-        "loss.%s",
-        old_symbol_map_new_symbol={"tp": "tp"},
-    )
-    links = dict()
-    links["out_emb.y"] = "loss.y"
-    links["loss.dy"] = "out_emb.dy"
-    transformer = ConnectGraph.apply([transformer, loss], links)
+    # Phase 17: skip the loss subgraph in inference mode.
+    if not inference:
+        loss = ReplicateGraph.apply(
+            TensorGraph.load_tensor_graph("./sharding_spreadsheets/module3/tpsp_moe/loss.csv"),
+            "loss.%s",
+            old_symbol_map_new_symbol={"tp": "tp"},
+        )
+        links = dict()
+        links["out_emb.y"] = "loss.y"
+        links["loss.dy"] = "out_emb.dy"
+        transformer = ConnectGraph.apply([transformer, loss], links)
 
     transformer.save_tensor_graph(cache_filename)
     return transformer

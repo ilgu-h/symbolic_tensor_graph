@@ -185,8 +185,38 @@ def main():
         required=False,
         help="Whether to print per-GPU VRAM footprint (total / params / acts / grads) in GiB",
     )
+    # Phase 17 (KernelCache): inference mode drops the backward subgraph
+    # from every loaded CSV tensor graph and skips GradUpdater. Default is
+    # "training" so pre-Phase-17 callers see byte-identical behavior.
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="training",
+        choices=["training", "inference"],
+        required=False,
+        help="training (default): full forward+backward+optimizer graph. "
+             "inference: forward-only, prefill-shaped. Cannot combine with "
+             "--weight_sharded or --activation_recompute.",
+    )
 
     args = parser.parse_args()
+
+    # Phase 17: reject training-only flag combinations in inference mode.
+    # FSDP and activation recomputation are gradient-related optimizations;
+    # they have no meaning without a backward pass. Fail loud so callers
+    # notice instead of silently emitting a graph that ignores the flag.
+    if args.mode == "inference" and args.weight_sharded:
+        parser.error("--mode inference is incompatible with --weight_sharded "
+                     "(FSDP is a training-only optimization).")
+    if args.mode == "inference" and args.activation_recompute:
+        parser.error("--mode inference is incompatible with --activation_recompute "
+                     "(activation recomputation is a training-only optimization).")
+    # Phase 17: micro-batching exists to amortize gradient accumulation.
+    # Inference has no gradients; force micro_batch=batch to short-circuit
+    # MicroBatchReplicator into a no-op instead of letting it assert on a
+    # mismatched micro_batch value.
+    if args.mode == "inference":
+        args.micro_batch = args.batch
 
     os.makedirs(args.output_dir, exist_ok=True)
     if not "%d" in args.output_name:
@@ -250,7 +280,8 @@ def main():
 
         print("Assembling dense model")
         transformer_dense = transformer_dense(
-            num_stacks, regenerate=True, tpsp=args.tpsp
+            num_stacks, regenerate=True, tpsp=args.tpsp,
+            inference=(args.mode == "inference"),
         )
         if os.environ.get("STAGE_MICROBATCH_OPTIMIZE", "0") == "0":
             transformer_dense = MicroBatchReplicator.apply(
@@ -278,7 +309,9 @@ def main():
         # transformer_dense.visualize("dense")
         # transformer_dense.save_tensor_graph("llama.csv")
 
-        transformer_dense = GradUpdater.apply(transformer_dense, inplace=True)
+        # Phase 17: GradUpdater appends W += dW — a training-only step.
+        if args.mode == "training":
+            transformer_dense = GradUpdater.apply(transformer_dense, inplace=True)
         spatial_parallel_dims_dense = [dp, tp, spp]
 
         symbol_map_value[tp] *= symbol_map_value[ep]
@@ -334,7 +367,8 @@ def main():
 
         print("Assembling dense model")
         transformer_dense = transformer_dense(
-            num_stacks, regenerate=True, tpsp=args.tpsp
+            num_stacks, regenerate=True, tpsp=args.tpsp,
+            inference=(args.mode == "inference"),
         )
         if os.environ.get("STAGE_MICROBATCH_OPTIMIZE", "0") == "0":
             transformer_dense = MicroBatchReplicator.apply(
@@ -362,7 +396,9 @@ def main():
         # transformer_dense.visualize("dense")
         # transformer_dense.save_tensor_graph("gpt.csv")
 
-        transformer_dense = GradUpdater.apply(transformer_dense, inplace=True)
+        # Phase 17: skip GradUpdater in inference mode.
+        if args.mode == "training":
+            transformer_dense = GradUpdater.apply(transformer_dense, inplace=True)
         spatial_parallel_dims_dense = [dp, tp, spp]
 
         symbol_map_value[tp] *= symbol_map_value[ep]
@@ -418,7 +454,10 @@ def main():
 
         assert args.tpsp
         print("Assembling moe model")
-        transformer_moe = transformer_moe(num_stacks, symbol_map_value, regenerate=True)
+        transformer_moe = transformer_moe(
+            num_stacks, symbol_map_value, regenerate=True,
+            inference=(args.mode == "inference"),
+        )
         if os.environ.get("STAGE_MICROBATCH_OPTIMIZE", "0") == "0":
             transformer_moe = MicroBatchReplicator.apply(
                 transformer_moe, symbol_map_value
@@ -445,7 +484,9 @@ def main():
 
         # transformer_moe.visualize("moe")
         # transformer_moe.save_tensor_graph("moe.csv")
-        transformer_moe = GradUpdater.apply(transformer_moe, inplace=True)
+        # Phase 17: skip GradUpdater in inference mode (MoE path).
+        if args.mode == "training":
+            transformer_moe = GradUpdater.apply(transformer_moe, inplace=True)
         spatial_parallel_dims_moe = [dp, tp, spp, ep]
 
         # moe model
@@ -495,7 +536,8 @@ def main():
 
     elif args.model_type == "debug":
         transformer_moe = TensorGraph.load_tensor_graph(
-            "./sharding_spreadsheets/module3/tpsp/embedding.csv"
+            "./sharding_spreadsheets/module3/tpsp/embedding.csv",
+            inference=(args.mode == "inference"),
         )
         transformer_moe = ReplicateGraph.apply(
             transformer_moe,
@@ -520,20 +562,28 @@ def main():
 
         # transformer_moe.visualize("moe")
         # transformer_moe.save_tensor_graph("moe.csv")
-        transformer_moe = GradUpdater.apply(transformer_moe, inplace=True)
+        # Phase 17: skip GradUpdater in inference mode (debug path).
+        if args.mode == "training":
+            transformer_moe = GradUpdater.apply(transformer_moe, inplace=True)
         spatial_parallel_dims_moe = [dp, tp, spp, ep]
 
         # moe model
         assert args.pp == 1
+        # Phase 17: dy@0 / dw@0 / dx@0 are backward tensors (dropped in
+        # inference) and w@1 is the post-GradUpdater weight revision
+        # (never created in inference). Only include them in training.
         pipeline_tensor_map = {
             "x@0": {pp: 0},
             "w@0": {pp: 0},
             "y@0": {pp: 0},
-            "dy@0": {pp: 0},
-            "dw@0": {pp: 0},
-            "dx@0": {pp: 0},
-            "w@1": {pp: 0},
         }
+        if args.mode == "training":
+            pipeline_tensor_map.update({
+                "dy@0": {pp: 0},
+                "dw@0": {pp: 0},
+                "dx@0": {pp: 0},
+                "w@1": {pp: 0},
+            })
 
         print("MoE model: Distributing")
         distributed_tensor_graph_moe = GraphDistributer.apply(
