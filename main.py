@@ -283,12 +283,21 @@ def main():
             num_stacks, regenerate=True, tpsp=args.tpsp,
             inference=(args.mode == "inference"),
         )
-        if os.environ.get("STAGE_MICROBATCH_OPTIMIZE", "0") == "0":
+        # Phase 17: MicroBatchReplicator.apply walks every weight looking
+        # for its .grad via get_weights_grads_others. In inference mode
+        # the gradient tensors were filtered out, so that walk fails
+        # with "list.remove(x): x not in list". Micro-batching only
+        # exists to amortize gradient accumulation anyway; in inference
+        # there's nothing to accumulate, so take the symbol-rename path
+        # (ReplicateGraph) which aliases Batch -> MicroBatch without
+        # touching gradients.
+        if args.mode == "training" and os.environ.get("STAGE_MICROBATCH_OPTIMIZE", "0") == "0":
             transformer_dense = MicroBatchReplicator.apply(
                 transformer_dense, symbol_map_value
             )
         else:
-            print("[Warning] MICROBATCH OPTIMIZE sometimes generate incorrect graphs, use with caution!")
+            if args.mode == "training":
+                print("[Warning] MICROBATCH OPTIMIZE sometimes generate incorrect graphs, use with caution!")
             transformer_dense = ReplicateGraph.apply(
                 transformer_dense,
                 inplace=True,
@@ -370,12 +379,21 @@ def main():
             num_stacks, regenerate=True, tpsp=args.tpsp,
             inference=(args.mode == "inference"),
         )
-        if os.environ.get("STAGE_MICROBATCH_OPTIMIZE", "0") == "0":
+        # Phase 17: MicroBatchReplicator.apply walks every weight looking
+        # for its .grad via get_weights_grads_others. In inference mode
+        # the gradient tensors were filtered out, so that walk fails
+        # with "list.remove(x): x not in list". Micro-batching only
+        # exists to amortize gradient accumulation anyway; in inference
+        # there's nothing to accumulate, so take the symbol-rename path
+        # (ReplicateGraph) which aliases Batch -> MicroBatch without
+        # touching gradients.
+        if args.mode == "training" and os.environ.get("STAGE_MICROBATCH_OPTIMIZE", "0") == "0":
             transformer_dense = MicroBatchReplicator.apply(
                 transformer_dense, symbol_map_value
             )
         else:
-            print("[Warning] MICROBATCH OPTIMIZE sometimes generate incorrect graphs, use with caution!")
+            if args.mode == "training":
+                print("[Warning] MICROBATCH OPTIMIZE sometimes generate incorrect graphs, use with caution!")
             transformer_dense = ReplicateGraph.apply(
                 transformer_dense,
                 inplace=True,
@@ -458,11 +476,17 @@ def main():
             num_stacks, symbol_map_value, regenerate=True,
             inference=(args.mode == "inference"),
         )
-        if os.environ.get("STAGE_MICROBATCH_OPTIMIZE", "0") == "0":
+        # Phase 17: skip MicroBatchReplicator.apply in inference mode
+        # (see analogous guard in the dense/gpt branches above for the
+        # rationale). The follow-up ReplicateGraph.apply is run for
+        # both paths; the only MoE-path difference is the disabled
+        # assert-false in the MICROBATCH_OPTIMIZE branch stays on the
+        # training side.
+        if args.mode == "training" and os.environ.get("STAGE_MICROBATCH_OPTIMIZE", "0") == "0":
             transformer_moe = MicroBatchReplicator.apply(
                 transformer_moe, symbol_map_value
             )
-        else:
+        elif args.mode == "training":
             print("[Warning] MICROBATCH OPTIMIZE sometimes generate incorrect graphs, use with caution!")
             assert False, "disable for now"
         transformer_moe = ReplicateGraph.apply(
